@@ -30,10 +30,10 @@ def get_random_proxy():
     
     try:
         # Parse the IP:PORT:USER:PASS format[cite: 2]
-        ip, port, user, password = chosen.split(':')
+        ip, port = chosen.split(':')
         
         # curl_cffi requires the standard http://user:pass@ip:port format
-        proxy_url = f"http://{user}:{password}@{ip}:{port}"
+        proxy_url = f"{ip}:{port}"
         return {
             "http": proxy_url,
             "https": proxy_url
