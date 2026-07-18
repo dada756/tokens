@@ -35,9 +35,8 @@ jobs:
           # Register a new ephemeral WARP client
           warp-cli --accept-tos registration new
           
-          # Switch to proxy mode (SOCKS5 on port 40000)
-          warp-cli --accept-tos mode proxy
-          warp-cli --accept-tos proxy port 40000
+          # Switch to DNS over HTTPS mode
+          warp-cli --accept-tos mode doh
           
           # Connect to the WARP network
           warp-cli --accept-tos connect
@@ -45,8 +44,8 @@ jobs:
           # Allow connection to stabilize
           sleep 5
           
-          # Verify proxy IP (Should be a Cloudflare IP, not an Azure Datacenter IP)
-          curl -x socks5h://127.0.0.1:40000 https://cloudflare.com/cdn-cgi/trace
+          # Verify IP (This will now show the raw GitHub runner Azure IP)
+          curl https://cloudflare.com/cdn-cgi/trace
           
       - name: Execute Bypass Engine
         env:
