@@ -3,11 +3,11 @@ name: Generate Clearance Token
 on:
   repository_dispatch:
     types: [generate-clearance-token]
-  workflow_dispatch: # Allows manual triggering from the GitHub UI for testing
+  workflow_dispatch: 
 
 jobs:
   extract_token:
-    runs-on: ubuntu-24.04 # Pinning to Ubuntu 24.04 as per your server management standard
+    runs-on: ubuntu-24.04
     
     steps:
       - name: Checkout Repository
@@ -23,38 +23,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install curl_cffi beautifulsoup4 requests
           
-      - name: Install Cloudflare WARP
-        run: |
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-          sudo apt-get update
-          sudo apt-get install -y cloudflare-warp
-
-      - name: Configure and Connect WARP Proxy
-        run: |
-          # Register a new ephemeral WARP client
-          warp-cli --accept-tos registration new
-          
-          # Switch to DNS over HTTPS mode
-          warp-cli --accept-tos mode doh
-          
-          # Connect to the WARP network
-          warp-cli --accept-tos connect
-          
-          # Allow connection to stabilize
-          sleep 5
-          
-          # Verify IP (This will now show the raw GitHub runner Azure IP)
-          curl https://cloudflare.com/cdn-cgi/trace
-          
       - name: Execute Bypass Engine
         env:
           VERCEL_API_URL: ${{ secrets.VERCEL_API_URL }}
           INTERNAL_API_SECRET: ${{ secrets.INTERNAL_API_SECRET }}
+          PROXY_LIST: ${{ secrets.PROXY_LIST }}
         run: |
-          python bypass2.py
-          
-      - name: Teardown WARP
-        if: always()
-        run: |
-          warp-cli --accept-tos disconnect
+          python scripts/bypass.py
