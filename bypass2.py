@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import re
+import random
 import email.utils
 import json
 from bs4 import BeautifulSoup
@@ -11,13 +12,46 @@ from curl_cffi import requests
 BROWSER_TOKEN = "3f132a0c3d414a8fb4a02775f61b6a04|7e902b4485babe129208d474402e921516f2f0d8b2b98cd23fb8a2e226bef6d3"
 VERCEL_API_URL = os.environ.get("VERCEL_API_URL")
 INTERNAL_API_SECRET = os.environ.get("INTERNAL_API_SECRET")
-
+PROXY_LIST_RAW = os.environ.get("PROXY_LIST", "")
 
 def log(msg):
     print(msg, flush=True)
 
+def get_random_proxy():
+    if not PROXY_LIST_RAW:
+        return None
+        
+    # Split the raw string by newlines to get individual proxy lines
+    proxies = [p.strip() for p in PROXY_LIST_RAW.split('\n') if p.strip()]
+    if not proxies:
+        return None
+        
+    chosen = random.choice(proxies)
+    
+    try:
+        # Parse the IP:PORT:USER:PASS format[cite: 2]
+        ip, port, user, password = chosen.split(':')
+        
+        # curl_cffi requires the standard http://user:pass@ip:port format
+        proxy_url = f"http://{user}:{password}@{ip}:{port}"
+        return {
+            "http": proxy_url,
+            "https": proxy_url
+        }
+    except ValueError:
+        log(f"[WARNING] Malformed proxy entry: {chosen}")
+        return None
+
 def run_scraper():
-    session = requests.Session(impersonate="chrome")
+    proxies = get_random_proxy()
+    if proxies:
+        # Log the IP being used for debugging (hiding credentials)
+        masked_ip = proxies['http'].split('@')[1]
+        log(f"> [NETWORK] Routing via Residential Proxy: {masked_ip}")
+    else:
+        log("> [WARNING] No valid proxies found in environment. Attempting raw connection.")
+
+    session = requests.Session(impersonate="chrome", proxies=proxies)
 
     log("> [STEP 1] Fetching ad token from scloudx.lol...")
     temp_ad_code = get_temp_ad_code(session)
@@ -57,7 +91,6 @@ def run_scraper():
     log("> [STEP 5] Handing off token to Next.js API...")
     handoff_url = f"{VERCEL_API_URL}/api/internal/token-sync"
     
-    # Standard requests library is fine here, no need to impersonate Chrome to talk to our own API
     import requests as std_requests
     response = std_requests.post(
         handoff_url,
@@ -78,6 +111,7 @@ def run_scraper():
         sys.exit(1)
 
 # --- HOLY HEADER IMPLEMENTATIONS ---
+# (Unchanged)
 
 def get_temp_ad_code(session):
     url = "https://scloudx.lol/get-search-token"
