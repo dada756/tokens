@@ -28,4 +28,4 @@ jobs:
           VERCEL_API_URL: ${{ secrets.VERCEL_API_URL }}
           INTERNAL_API_SECRET: ${{ secrets.INTERNAL_API_SECRET }}
         run: |
-          python bypass.py
+          python bypass2.py
