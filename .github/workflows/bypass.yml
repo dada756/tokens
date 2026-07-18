@@ -29,4 +29,4 @@ jobs:
           INTERNAL_API_SECRET: ${{ secrets.INTERNAL_API_SECRET }}
           PROXY_LIST: ${{ secrets.PROXY_LIST }}
         run: |
-          python scripts/bypass.py
+          python bypass.py
