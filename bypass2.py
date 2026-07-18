@@ -12,11 +12,6 @@ BROWSER_TOKEN = "3f132a0c3d414a8fb4a02775f61b6a04|7e902b4485babe129208d474402e92
 VERCEL_API_URL = os.environ.get("VERCEL_API_URL")
 INTERNAL_API_SECRET = os.environ.get("INTERNAL_API_SECRET")
 
-# Cloudflare WARP local proxy (set up by the GitHub Action)
-PROXIES = {
-    "http": "socks5://127.0.0.1:40000",
-    "https": "socks5://127.0.0.1:40000"
-}
 
 def log(msg):
     print(msg, flush=True)
