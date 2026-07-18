@@ -45,9 +45,8 @@ def get_random_proxy():
 def run_scraper():
     proxies = get_random_proxy()
     if proxies:
-        # Log the IP being used for debugging (hiding credentials)
-        masked_ip = proxies['http'].split('@')[1]
-        log(f"> [NETWORK] Routing via Residential Proxy: {masked_ip}")
+        # Log the IP being used for debugging (hiding credentials
+        log(f"> [NETWORK] Routing via Residential Proxy")
     else:
         log("> [WARNING] No valid proxies found in environment. Attempting raw connection.")
 
