@@ -1,0 +1,31 @@
+name: Generate Clearance Token
+
+on:
+  repository_dispatch:
+    types: [generate-clearance-token]
+  workflow_dispatch: # Allows manual triggering from the GitHub UI for testing
+
+jobs:
+  extract_token:
+    runs-on: ubuntu-24.04 # Pinning to Ubuntu 24.04 as per your server management standard
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install curl_cffi beautifulsoup4 requests
+      
+      - name: Execute Bypass Engine
+        env:
+          VERCEL_API_URL: ${{ secrets.VERCEL_API_URL }}
+          INTERNAL_API_SECRET: ${{ secrets.INTERNAL_API_SECRET }}
+        run: |
+          python bypass.py
