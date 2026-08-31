@@ -1,0 +1,361 @@
+name: Samsung TV Audio Normalization Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_link:
+        description: 'Direct link to payload (Drive, Torrent, Magnet)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  process-queue:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Free Up Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Install Dependencies
+        run: |
+          # Add Cloudflare official repository for WARP
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          
+          # We retain ffmpeg, curl, jq, unzip, unrar, and warp for downloads & processing
+          sudo apt-get update && sudo apt-get install -y ffmpeg libcurl4-openssl-dev jq unzip unrar cloudflare-warp
+          
+          # Dropped guessit, but kept requests, google-auth, tqdm, and huggingface_hub for cloud ops
+          pip install -U --break-system-packages "huggingface_hub[cli]" requests google-auth tqdm
+
+      - name: Acknowledge Payload
+        id: payload_ack
+        run: |
+          echo "Target acquired: ${{ inputs.target_link }}"
+          echo "TARGET_LINK=${{ inputs.target_link }}" >> $GITHUB_ENV
+          echo "found=true" >> $GITHUB_ENV
+
+      - name: Download and Extract Payload
+        if: env.found == 'true'
+        env:
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+        run: |
+          mkdir -p workspace
+          echo "Evaluating Payload Type..."
+
+          # --- GLOBAL WARP INITIALIZATION ---
+          echo "🌐 Initializing Cloudflare WARP Proxy globally..."
+          warp-cli --accept-tos registration new
+          warp-cli --accept-tos mode proxy
+          warp-cli --accept-tos connect
+
+          echo "⏳ Waiting for WARP connection to stabilize..."
+          for i in {1..12}; do
+            if curl -s -x socks5://127.0.0.1:40000 https://cloudflare.com/cdn-cgi/trace | grep -q "warp=on"; then
+              echo "✅ WARP Proxy successfully established."
+              break
+            fi
+            echo "Retrying WARP check ($i/12)..."
+            sleep 5
+          done
+
+          # --- ROUTING ENGINE (Kept from Original) ---
+          IS_TORRENT=false
+          if [[ "$TARGET_LINK" == magnet:* ]] || [[ "$TARGET_LINK" == *.torrent* ]]; then
+            IS_TORRENT=true
+          fi
+
+          if [[ "$TARGET_LINK" == *drive.google.com* ]] || [[ "$TARGET_LINK" == *drive.usercontent.google.com* ]]; then
+            # --- BRANCH 1: GOOGLE DRIVE ---
+            if [[ "$TARGET_LINK" == *\&at=* ]] || [[ "$TARGET_LINK" == *confirm=t* ]]; then
+              echo "🚀 Detected Pre-Authenticated Direct Drive Link."
+              cd workspace && curl -# -L -OJ "$TARGET_LINK" && cd ..
+            else
+              echo "🌐 Detected Standard Google Drive Link. Initializing Lightning SA Downloader..."
+              cat << 'EOF' > gdrive_sa_dl.py
+          import os, sys, re, json, requests
+          from google.oauth2 import service_account
+          from google.auth.transport.requests import Request
+          from tqdm import tqdm
+          link, sa_json_str = sys.argv[1], os.environ.get('GCP_SA_JSON')
+          if not sa_json_str: sys.exit(1)
+          sa_info = json.loads(sa_json_str)
+          creds = service_account.Credentials.from_service_account_info(sa_info, scopes=['https://www.googleapis.com/auth/drive.readonly'])
+          creds.refresh(Request())
+          headers = {'Authorization': f'Bearer {creds.token}'}
+          match = re.search(r'(id=|/d/|folders/)([a-zA-Z0-9_-]+)', link)
+          file_id = match.group(2)
+          def download_file(fid, fname):
+              url = f"https://www.googleapis.com/drive/v3/files/{fid}?alt=media"
+              with requests.get(url, headers=headers, stream=True) as r:
+                  total_size = int(r.headers.get('Content-Length', 0))
+                  with open(os.path.join("workspace", fname), 'wb') as f:
+                      with tqdm(total=total_size, unit='iB', unit_scale=True, desc=fname[:30], ascii=True) as pbar:
+                          for chunk in r.iter_content(chunk_size=1024*1024*10):
+                              if chunk: f.write(chunk); pbar.update(len(chunk))
+          def process_node(fid):
+              res = requests.get(f"https://www.googleapis.com/drive/v3/files/{fid}?fields=name,mimeType", headers=headers).json()
+              if res.get('mimeType') == 'application/vnd.google-apps.folder':
+                  children = requests.get(f"https://www.googleapis.com/drive/v3/files?q='{fid}'+in+parents+and+trashed=false", headers=headers).json().get('files', [])
+                  for child in children: process_node(child['id'])
+              else: download_file(fid, res['name'])
+          process_node(file_id)
+          EOF
+              python gdrive_sa_dl.py "$TARGET_LINK"
+            fi
+
+          elif [[ "$IS_TORRENT" == "false" ]] && [[ "$TARGET_LINK" == http* ]]; then
+            # --- BRANCH 2: DIRECT HTTP (yt-dlp) ---
+            echo "📎 Detected Direct HTTP Link. Using Global WARP Proxy..."
+            HEADERS=$(curl -g -sIL -x socks5h://127.0.0.1:40000 -H 'User-Agent: Mozilla/5.0' "$TARGET_LINK" || true)
+            SERVER_FILENAME=$(python3 -c "import sys, re, urllib.parse; h=sys.stdin.read(); m=re.search(r'(?i)filename\*?=(?:\"?UTF-8\'\'\"?)?([^\r\n;]+)', h); print(urllib.parse.unquote(m.group(1).strip(' \"\'')) if m else 'Direct_Payload.mkv')" <<< "$HEADERS")
+            
+            wget -qO yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux && chmod +x yt-dlp
+            ./yt-dlp --proxy "socks5://127.0.0.1:40000" --add-header 'User-Agent: Mozilla/5.0' -N 16 -o "workspace/$SERVER_FILENAME" "$TARGET_LINK"
+
+          else
+            # --- BRANCH 3: TORRENT ENGINE ---
+            echo "🧲 Torrent Source Detected. Configuring Aggressive Cloud Engine..."
+            wget -qO qbittorrent-nox https://github.com/userdocs/qbittorrent-nox-static/releases/latest/download/x86_64-qbittorrent-nox
+            chmod +x qbittorrent-nox
+            mkdir -p ~/.config/qBittorrent
+            
+            cat << EOF_CONF > ~/.config/qBittorrent/qBittorrent.conf
+          [Preferences]
+          WebUI\Port=8085
+          WebUI\AuthSubnetWhitelistEnabled=true
+          WebUI\AuthSubnetWhitelist=127.0.0.1/32, ::1/128
+          WebUI\LocalHostAuth=false
+          Downloads\SavePath=$(pwd)/workspace/
+          BitTorrent\Session\MaxConnections=500
+          BitTorrent\Session\Encryption=1
+          BitTorrent\Session\DHT=true
+          BitTorrent\Session\PeX=true
+          BitTorrent\Session\LSD=false
+          Network\Port=443
+          Proxy\Type=2
+          Proxy\IP=127.0.0.1
+          Proxy\Port=40000
+          Proxy\Enabled=true
+          Proxy\PeerExchange=true
+          Proxy\OnlyForTorrents=false
+          EOF_CONF
+
+            ./qbittorrent-nox -d --confirm-legal-notice
+            
+            cat << 'EOF_PY' > qbit_monitor.py
+          import time, requests, sys
+          target_link, base_url = sys.argv[1], "http://127.0.0.1:8085/api/v2"
+          def log(m): print(m, flush=True)
+          for _ in range(30):
+              try: 
+                  requests.get(f"{base_url}/app/version"); break
+              except: time.sleep(1)
+          res = requests.post(f"{base_url}/torrents/add", data={'urls': target_link})
+          log("📡 Torrent added. Waiting for peers...")
+          last_p, start_t, last_log = -1, time.time(), 0
+          while True:
+              try:
+                  torrents = requests.get(f"{base_url}/torrents/info").json()
+                  if not torrents: 
+                      if time.time() - start_t > 60: sys.exit(1)
+                      time.sleep(2); continue
+                  t = torrents[0]
+                  state, progress = t.get('state'), t.get('progress', 0)
+                  speed = t.get('dlspeed', 0) / (1024*1024)
+                  if progress > last_p: start_t, last_p = time.time(), progress
+                  if time.time() - last_log >= 10:
+                      log(f"🔄 [{state.upper()}] | {progress*100:.2f}% | {speed:.2f} MB/s | Seeds: {t.get('num_seeds')} | Peers: {t.get('num_leechs')}")
+                      last_log = time.time()
+                  if progress == 1.0 or state in ['uploading', 'stalledUP', 'queuedUP']: break
+                  if time.time() - start_t > 600: 
+                      log("❌ Stalled for 10m. Check peer availability."); sys.exit(1)
+                  time.sleep(2)
+              except Exception as e: time.sleep(2)
+          EOF_PY
+            python3 qbit_monitor.py "$TARGET_LINK"
+            curl -s -X POST http://127.0.0.1:8085/api/v2/app/shutdown || true
+            rm qbittorrent-nox
+          fi
+
+          echo "🛑 Disconnecting WARP Proxy..."
+          warp-cli --accept-tos disconnect
+
+          # --- EXTRACTION ENGINE ---
+          echo "🔍 Processing archives..."
+          find workspace -type f -name "*.zip" -exec unzip -q -o {} -d workspace/ \; -exec rm {} \;
+          while read -u 9 RAR; do
+            echo "📦 Extracting: $RAR"
+            unrar e -y "$RAR" workspace/ || true
+            DIR=$(dirname "$RAR")
+            rm -f "$DIR"/*.rar "$DIR"/*.r[0-9][0-9] "$DIR"/*.s[0-9][0-9] "$DIR"/*.sfv "$DIR"/*.nfo
+            rm -rf "$DIR/Sample" || true
+          done 9< <(find workspace -type f -name "*.rar")
+
+          if [ $(find workspace -type f \( -name "*.mkv" -o -name "*.mp4" \) | wc -l) -eq 0 ]; then
+            echo "❌ No video files found." && exit 1
+          fi
+
+      - name: Audio Normalization & Muxing Engine
+        if: env.found == 'true'
+        run: |
+          mkdir -p processed_media
+          
+          # Write the Smart Audio Engine Python Script
+          cat << 'EOF' > audio_engine.py
+          import os, sys, json, subprocess
+
+          file_path = sys.argv[1]
+          original_filename = os.path.basename(file_path)
+          
+          # Always output to .mkv to ensure compatibility with all subtitle formats (e.g., PGS)
+          output_filename = os.path.splitext(original_filename)[0] + ".mkv"
+          output_path = os.path.join("processed_media", output_filename)
+
+          print(f"\n🎥 Analyzing File: {original_filename}")
+          
+          # Extract stream details via ffprobe
+          probe_cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', file_path]
+          result = subprocess.run(probe_cmd, capture_output=True, text=True)
+          
+          try:
+              streams = json.loads(result.stdout).get('streams', [])
+          except Exception as e:
+              print(f"❌ Failed to parse ffprobe output: {e}")
+              sys.exit(1)
+
+          # Find Video Track (Ignoring attached pictures/cover art)
+          video_idx = -1
+          for s in streams:
+              if s.get('codec_type') == 'video' and s.get('disposition', {}).get('attached_pic', 0) == 0:
+                  video_idx = s['index']
+                  break
+          
+          if video_idx == -1:
+              print("❌ No valid video stream found!")
+              sys.exit(1)
+
+          # Find and Filter Audio Tracks
+          audio_streams = []
+          for s in streams:
+              if s.get('codec_type') == 'audio':
+                  title = s.get('tags', {}).get('title', '').lower()
+                  # Filter out commentaries
+                  if 'commentary' in title or 'director' in title:
+                      print(f"🗑️ Dropping Commentary Track: {title} (Index {s['index']})")
+                      continue
+                  audio_streams.append(s)
+
+          ffmpeg_cmd = ['ffmpeg', '-nostdin', '-y', '-i', file_path]
+          
+          # 1. Map the core Video Track (Passthrough)
+          ffmpeg_cmd.extend(['-map', f'0:{video_idx}', '-c:v', 'copy'])
+
+          # 2. Map all Subtitle Tracks (Passthrough)
+          for s in streams:
+              if s.get('codec_type') == 'subtitle':
+                  ffmpeg_cmd.extend(['-map', f'0:{s["index"]}'])
+          ffmpeg_cmd.extend(['-c:s', 'copy'])
+
+          # 3. Audio Selection & Conversion Logic
+          if audio_streams:
+              def rank_score(stream):
+                  codec = stream.get('codec_name', '').lower()
+                  channels = int(stream.get('channels', 2))
+                  bit_rate = int(stream.get('bit_rate', 0))
+                  
+                  # Heuristic to handle missing bitrate metadata in lossless tracks
+                  score = 0
+                  if 'truehd' in codec or 'dts-hd' in codec:
+                      score += 100000000
+                  elif 'dts' in codec or 'pcm' in codec:
+                      score += 50000000
+                  
+                  score += channels * 1000000
+                  score += bit_rate
+                  return score
+              
+              # Isolate absolute best audio track based on heuristic score
+              best_audio = max(audio_streams, key=rank_score)
+              audio_idx = best_audio['index']
+              codec = best_audio.get('codec_name', '').lower()
+              channels = int(best_audio.get('channels', 2))
+              title = best_audio.get('tags', {}).get('title', 'Unknown Title')
+              
+              print(f"🎯 Selected Best Audio Track: Index {audio_idx} | {codec.upper()} | {channels} Channels | Title: {title}")
+              ffmpeg_cmd.extend(['-map', f'0:{audio_idx}'])
+
+              supported_codecs = ['eac3', 'ac3', 'aac']
+              
+              if codec in supported_codecs:
+                  print(f"✅ Track is natively supported by Samsung TV ({codec.upper()}). Passing through...")
+                  ffmpeg_cmd.extend(['-c:a', 'copy'])
+              else:
+                  print(f"🔄 Unsupported format ({codec.upper()}). Transcoding to high-fidelity E-AC-3 (DDP)...")
+                  if channels >= 7:
+                      # 7.1 Audio - Ultra High Bitrate
+                      ffmpeg_cmd.extend(['-c:a', 'eac3', '-b:a', '1024k'])
+                  elif channels >= 5:
+                      # 5.1 Audio - High Bitrate
+                      ffmpeg_cmd.extend(['-c:a', 'eac3', '-b:a', '640k'])
+                  else:
+                      # Stereo - Standard Bitrate
+                      ffmpeg_cmd.extend(['-c:a', 'eac3', '-b:a', '256k'])
+          else:
+              print("⚠️ No valid audio tracks found (or all were commentaries). Proceeding without audio.")
+
+          ffmpeg_cmd.append(output_path)
+
+          # Execute the command
+          print("\n⚙️ Executing FFmpeg Engine...")
+          subprocess.run(ffmpeg_cmd, check=True)
+          print("✅ Muxing and Audio Normalization Complete!")
+          EOF
+
+          # Process every video file found in the workspace
+          find workspace -type f \( -name "*.mkv" -o -name "*.mp4" \) | while read VIDEO_FILE; do
+            python3 audio_engine.py "$VIDEO_FILE"
+            
+            echo "🗑️ Deleting original file to save disk space: $VIDEO_FILE"
+            rm -f "$VIDEO_FILE"
+          done
+
+      - name: Sync Output to Storage Bucket
+        if: env.found == 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_BUCKET: ${{ secrets.HF_BUCKET }}
+        run: |
+          echo "📤 Initiating Upload to Cloud Storage Bucket..."
+          
+          python3 -c "
+          import os
+          from huggingface_hub import batch_bucket_files
+          
+          token = os.environ.get('HF_TOKEN')
+          bucket = os.environ.get('HF_BUCKET')
+          
+          folder = './processed_media'
+          for item in os.listdir(folder):
+              local_path = os.path.join(folder, item)
+              if os.path.isfile(local_path):
+                  print(f'⚡ Uploading {item} to {bucket}...')
+                  batch_bucket_files(bucket, add=[(local_path, item)], token=token)
+          "
+          echo "✅ File uploaded successfully to Cloud Storage Bucket."
