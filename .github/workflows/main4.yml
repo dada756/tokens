@@ -1,0 +1,276 @@
+name: Raw
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_link:
+        description: 'Manual Target Link (Leave empty to fetch from Discord)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  process-payload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Free Up Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Install Dependencies
+        run: |
+          # Add Cloudflare official repository for WARP
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          
+          # Install core download/upload and extraction dependencies
+          sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev jq unzip unrar cloudflare-warp ffmpeg
+          
+          # Install Python dependencies including tqdm for GDrive visual progress
+          pip install -U --break-system-packages "huggingface_hub[cli]" requests google-auth tqdm
+
+      - name: Fetch Target Link (Manual or Discord)
+        id: fetch_target
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+          MANUAL_LINK: ${{ inputs.target_link }}
+        run: |
+          if [ -n "$MANUAL_LINK" ]; then
+            echo "🎯 Manual Target acquired: $MANUAL_LINK"
+            echo "MSG_ID=manual_${{ github.run_id }}" >> $GITHUB_ENV
+            echo "TARGET_LINK=$MANUAL_LINK" >> $GITHUB_ENV
+            echo "found=true" >> $GITHUB_ENV
+          else
+            echo "📡 No manual input. Fetching from Discord queue..."
+            g++ discord_manager.cpp -o discord_manager -lcurl
+            
+            OUTPUT=$(./discord_manager "$DISCORD_TOKEN" "$CHANNEL_ID" fetch)
+            MSG_ID=$(echo "$OUTPUT" | cut -d'|' -f1)
+            TARGET_LINK=$(echo "$OUTPUT" | cut -d'|' -f2-)
+            
+            if [ -z "$TARGET_LINK" ] || [ "$MSG_ID" == "empty" ] || [ "$MSG_ID" == "error" ]; then
+              echo "❌ Queue is empty or API Error."
+              echo "found=false" >> $GITHUB_ENV
+              exit 0
+            fi
+            
+            echo "🎯 Discord Target acquired: $TARGET_LINK"
+            echo "MSG_ID=$MSG_ID" >> $GITHUB_ENV
+            echo "TARGET_LINK=$TARGET_LINK" >> $GITHUB_ENV
+            echo "found=true" >> $GITHUB_ENV
+          fi
+
+      - name: Download and Extract Payload
+        if: env.found == 'true'
+        env:
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+        run: |
+          mkdir -p workspace
+          echo "Evaluating Payload Type..."
+
+          # --- GLOBAL WARP INITIALIZATION ---
+          echo "🌐 Initializing Cloudflare WARP Proxy globally..."
+          warp-cli --accept-tos registration new
+          warp-cli --accept-tos mode proxy
+          warp-cli --accept-tos connect
+
+          echo "⏳ Waiting for WARP connection to stabilize..."
+          for i in {1..12}; do
+            if curl -s -x socks5://127.0.0.1:40000 https://cloudflare.com/cdn-cgi/trace | grep -q "warp=on"; then
+              echo "✅ WARP Proxy successfully established."
+              break
+            fi
+            echo "Retrying WARP check ($i/12)..."
+            sleep 5
+          done
+
+          # --- ROUTING ENGINE ---
+          IS_TORRENT=false
+          if [[ "$TARGET_LINK" == magnet:* ]] || [[ "$TARGET_LINK" == *.torrent* ]]; then
+            IS_TORRENT=true
+          fi
+
+          if [[ "$TARGET_LINK" == *drive.google.com* ]] || [[ "$TARGET_LINK" == *drive.usercontent.google.com* ]]; then
+            # --- BRANCH 1: GOOGLE DRIVE ---
+            if [[ "$TARGET_LINK" == *\&at=* ]] || [[ "$TARGET_LINK" == *confirm=t* ]]; then
+              echo "🚀 Detected Pre-Authenticated Direct Drive Link."
+              cd workspace && curl -# -L -OJ "$TARGET_LINK" && cd ..
+            else
+              echo "🌐 Detected Standard Google Drive Link. Initializing Lightning SA Downloader..."
+              cat << 'EOF' > gdrive_sa_dl.py
+          import os, sys, re, json, requests
+          from google.oauth2 import service_account
+          from google.auth.transport.requests import Request
+          from tqdm import tqdm
+          link, sa_json_str = sys.argv[1], os.environ.get('GCP_SA_JSON')
+          if not sa_json_str: sys.exit(1)
+          sa_info = json.loads(sa_json_str)
+          creds = service_account.Credentials.from_service_account_info(sa_info, scopes=['https://www.googleapis.com/auth/drive.readonly'])
+          creds.refresh(Request())
+          headers = {'Authorization': f'Bearer {creds.token}'}
+          match = re.search(r'(id=|/d/|folders/)([a-zA-Z0-9_-]+)', link)
+          file_id = match.group(2)
+          def download_file(fid, fname):
+              url = f"https://www.googleapis.com/drive/v3/files/{fid}?alt=media"
+              with requests.get(url, headers=headers, stream=True) as r:
+                  total_size = int(r.headers.get('Content-Length', 0))
+                  with open(os.path.join("workspace", fname), 'wb') as f:
+                      with tqdm(total=total_size, unit='iB', unit_scale=True, desc=fname[:30], ascii=True) as pbar:
+                          for chunk in r.iter_content(chunk_size=1024*1024*10):
+                              if chunk: f.write(chunk); pbar.update(len(chunk))
+          def process_node(fid):
+              res = requests.get(f"https://www.googleapis.com/drive/v3/files/{fid}?fields=name,mimeType", headers=headers).json()
+              if res.get('mimeType') == 'application/vnd.google-apps.folder':
+                  children = requests.get(f"https://www.googleapis.com/drive/v3/files?q='{fid}'+in+parents+and+trashed=false", headers=headers).json().get('files', [])
+                  for child in children: process_node(child['id'])
+              else: download_file(fid, res['name'])
+          process_node(file_id)
+          EOF
+              python3 gdrive_sa_dl.py "$TARGET_LINK"
+            fi
+
+          elif [[ "$IS_TORRENT" == "false" ]] && [[ "$TARGET_LINK" == http* ]]; then
+            # --- BRANCH 2: DIRECT HTTP (yt-dlp) ---
+            echo "📎 Detected Direct HTTP Link. Using Global WARP Proxy..."
+            HEADERS=$(curl -g -sIL -x socks5h://127.0.0.1:40000 -H 'User-Agent: Mozilla/5.0' "$TARGET_LINK" || true)
+            SERVER_FILENAME=$(python3 -c "import sys, re, urllib.parse; h=sys.stdin.read(); m=re.search(r'(?i)filename\*?=(?:\"?UTF-8\'\'\"?)?([^\r\n;]+)', h); print(urllib.parse.unquote(m.group(1).strip(' \"\'')) if m else 'Direct_Payload.mkv')" <<< "$HEADERS")
+            
+            wget -qO yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux && chmod +x yt-dlp
+            ./yt-dlp --proxy "socks5://127.0.0.1:40000" --add-header 'User-Agent: Mozilla/5.0' -N 16 -o "workspace/$SERVER_FILENAME" "$TARGET_LINK"
+
+          else
+            # --- BRANCH 3: TORRENT ENGINE (Magnet or .torrent) ---
+            echo "🧲 Torrent Source Detected. Configuring Aggressive Cloud Engine..."
+            wget -qO qbittorrent-nox https://github.com/userdocs/qbittorrent-nox-static/releases/latest/download/x86_64-qbittorrent-nox
+            chmod +x qbittorrent-nox
+            mkdir -p ~/.config/qBittorrent
+            
+            cat << EOF_CONF > ~/.config/qBittorrent/qBittorrent.conf
+          [Preferences]
+          WebUI\Port=8085
+          WebUI\AuthSubnetWhitelistEnabled=true
+          WebUI\AuthSubnetWhitelist=127.0.0.1/32, ::1/128
+          WebUI\LocalHostAuth=false
+          Downloads\SavePath=$(pwd)/workspace/
+          # Aggressive NAT piercing & Proxy forcing
+          BitTorrent\Session\MaxConnections=500
+          BitTorrent\Session\Encryption=1
+          BitTorrent\Session\DHT=true
+          BitTorrent\Session\PeX=true
+          BitTorrent\Session\LSD=false
+          Network\Port=443
+          Proxy\Type=2
+          Proxy\IP=127.0.0.1
+          Proxy\Port=40000
+          Proxy\Enabled=true
+          Proxy\PeerExchange=true
+          Proxy\OnlyForTorrents=false
+          EOF_CONF
+
+            ./qbittorrent-nox -d --confirm-legal-notice
+            
+            cat << 'EOF_PY' > qbit_monitor.py
+          import time, requests, sys
+          target_link, base_url = sys.argv[1], "http://127.0.0.1:8085/api/v2"
+          def log(m): print(m, flush=True)
+          for _ in range(30):
+              try: 
+                  requests.get(f"{base_url}/app/version"); break
+              except: time.sleep(1)
+          res = requests.post(f"{base_url}/torrents/add", data={'urls': target_link})
+          log("📡 Torrent added. Waiting for peers...")
+          last_p, start_t, last_log = -1, time.time(), 0
+          while True:
+              try:
+                  torrents = requests.get(f"{base_url}/torrents/info").json()
+                  if not torrents: 
+                      if time.time() - start_t > 60: sys.exit(1)
+                      time.sleep(2); continue
+                  t = torrents[0]
+                  state, progress = t.get('state'), t.get('progress', 0)
+                  speed = t.get('dlspeed', 0) / (1024*1024)
+                  if progress > last_p: start_t, last_p = time.time(), progress
+                  if time.time() - last_log >= 10:
+                      log(f"🔄 [{state.upper()}] | {progress*100:.2f}% | {speed:.2f} MB/s | Seeds: {t.get('num_seeds')} | Peers: {t.get('num_leechs')}")
+                      last_log = time.time()
+                  if progress == 1.0 or state in ['uploading', 'stalledUP', 'queuedUP']: break
+                  if time.time() - start_t > 600: 
+                      log("❌ Stalled for 10m. Check peer availability or .torrent file health."); sys.exit(1)
+                  time.sleep(2)
+              except Exception as e: time.sleep(2)
+          EOF_PY
+            python3 qbit_monitor.py "$TARGET_LINK"
+            curl -s -X POST http://127.0.0.1:8085/api/v2/app/shutdown || true
+            rm qbittorrent-nox
+          fi
+
+          echo "🛑 Disconnecting WARP Proxy..."
+          warp-cli --accept-tos disconnect || true
+
+          # --- EXTRACTION ENGINE ---
+          echo "🔍 Processing archives..."
+          find workspace -type f -name "*.zip" -exec unzip -q -o {} -d workspace/ \; -exec rm {} \;
+          while read -u 9 RAR; do
+            echo "📦 Extracting: $RAR"
+            unrar e -y "$RAR" workspace/ || true
+            DIR=$(dirname "$RAR")
+            rm -f "$DIR"/*.rar "$DIR"/*.r[0-9][0-9] "$DIR"/*.s[0-9][0-9] "$DIR"/*.sfv "$DIR"/*.nfo
+            rm -rf "$DIR/Sample" || true
+          done 9< <(find workspace -type f -name "*.rar")
+
+      - name: Sync Raw Payload to Storage Bucket
+        if: env.found == 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_BUCKET: ${{ secrets.HF_BUCKET }}
+        run: |
+          python3 -c "
+          import os
+          from huggingface_hub import login, sync_bucket
+          token = os.environ.get('HF_TOKEN')
+          bucket = os.environ.get('HF_BUCKET')
+          msg_id = os.environ.get('MSG_ID')
+          
+          print('🚀 Authenticating Hugging Face SDK...')
+          login(token=token)
+          
+          print('⚡ Initiating Raw Storage Bucket sync...')
+          # Uploads contents of workspace/ into a specific folder tracked by Discord MSG_ID
+          sync_bucket('./workspace', f'hf://buckets/{bucket}/downloads/{msg_id}')
+          "
+          
+          echo "✅ Raw Bucket Sync completed successfully."
+
+      - name: Report Status to Discord
+        if: always() && env.found == 'true'
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          QUEUE_CH: ${{ secrets.DISCORD_CHANNEL_ID }}
+          PING_CH: ${{ secrets.DISCORD_PING_CHANNEL_ID }}
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            TOTAL_SIZE=$(du -sh workspace | cut -f1)
+            if [[ ! "$MSG_ID" == manual_* ]]; then
+              ./discord_manager "$DISCORD_TOKEN" "$QUEUE_CH" delete "$MSG_ID"
+            fi
+            ./discord_manager "$DISCORD_TOKEN" "$PING_CH" send "✅ **Raw Download & Bucket Sync Complete!** \n📦 Payload Size: \`${TOTAL_SIZE}\`\n📁 Uploaded to folder: \`downloads/${MSG_ID}\` via CDN."
+          else
+            PAYLOAD=$(jq -n --arg c "❌ **Raw Pipeline Failed!** \n🔗[View Logs](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})" '{content: $c}')
+            curl -s -H "Authorization: Bot $DISCORD_TOKEN" -H "Content-Type: application/json" -X POST -d "$PAYLOAD" "https://discord.com/api/v10/channels/$PING_CH/messages"
+          fi
